@@ -60,6 +60,9 @@ usage(FILE * stream) {
     fprintf(stream, "\n");
     fprintf(stream, "\t-d <n_max_datasets>          (optional) Max number of dataset lines to process in the input file.\n");
     fprintf(stream, "\n");
+    fprintf(stream, "\t-g                           (optional) Turn dataset names like /name/of/dset into a series of nested groups.\n");
+    fprintf(stream, "\t                             Default is to not do this, munge '/' to '-' in the name, and create a single dataset.\n");
+    fprintf(stream, "\n");
     fprintf(stream, "\t-h                           Print this help message.\n");
     fprintf(stream, "\n");
     fprintf(stream, "\t-i <input_filename>          Input dataset list filename.\n");
@@ -103,7 +106,7 @@ error:
 } /* end setup_rados_vol() */
 
 static int
-read_input_file(const char *filename, int max_datasets, /*out*/ int *actual_datasets, 
+read_input_file(const char *filename, int munge_dataset_names, int max_datasets, /*out*/ int *actual_datasets, 
         /*out*/ char **dset_info_names, /*out*/ int *dset_info_sizes, /*out*/ long long *max_size, 
         /*out*/ long long *total_size)
 {
@@ -148,11 +151,12 @@ read_input_file(const char *filename, int max_datasets, /*out*/ int *actual_data
         
         /* Since the dataset names look like paths, we have to
          * substitute the '/' character or HDF5 will get grumpy.
-         */  
-        for (j = 0; j < strlen(dset_info_names[i]); j++) {
-            if (dset_info_names[i][j] == '/') 
-                dset_info_names[i][j] = '-';
-        }
+         */
+        if (munge_dataset_names)
+            for (j = 0; j < strlen(dset_info_names[i]); j++) {
+                if (dset_info_names[i][j] == '/') 
+                    dset_info_names[i][j] = '-';
+            }
 
         i++;
     }
@@ -198,9 +202,11 @@ main(int argc, char* argv[])
     char *rados_pool = NULL;                /* name of the RADOS pool */
 
     /* HDF5 things */
+    int create_intermediate_groups = 0;     /* whether to create intermediate groups or just a single dataset */
     hid_t fapl_id = H5I_INVALID_HID;        /* file access property list ID */
     hid_t fid = H5I_INVALID_HID;            /* file ID */
     hid_t fsid = H5I_INVALID_HID;           /* file dataspace ID */
+    hid_t lcpl_id = H5I_INVALID_HID;        /* link creation property list ID */
     hid_t did = H5I_INVALID_HID;            /* dataset ID */
     hsize_t dims[3] = {0};                  /* dataspace dimensions */
 
@@ -224,7 +230,7 @@ main(int argc, char* argv[])
 
     opterr = 0;
 
-    while ((c = getopt (argc, argv, "c:d:hi:o:p:v:")) != -1)
+    while ((c = getopt (argc, argv, "c:d:ghi:o:p:v:")) != -1)
         switch (c)
         {
             case 'c':
@@ -232,6 +238,9 @@ main(int argc, char* argv[])
                 break;
             case 'd':
                 max_datasets = atoi(optarg);
+                break;
+            case 'g':
+                create_intermediate_groups = 1;
                 break;
             case 'h':
                 if (0 == rank)
@@ -317,9 +326,12 @@ main(int argc, char* argv[])
         dset_info_names[i] = dset_info_names_1d + i * DSET_NAME_MAX;
 
     /* Rank 0 reads the input file */
-    if (0 == rank)
-        if (read_input_file(in_filename, max_datasets, &n_datasets, dset_info_names, dset_info_sizes, &max_size, &total_size) < 0)
+    if (0 == rank) {
+        int munge_dataset_names = !create_intermediate_groups;
+
+        if (read_input_file(in_filename, munge_dataset_names, max_datasets, &n_datasets, dset_info_names, dset_info_sizes, &max_size, &total_size) < 0)
             GOTO_ERROR
+    }
 
     /* Broadcast the input file data */
     MPI_Bcast(&n_datasets, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -343,6 +355,20 @@ main(int argc, char* argv[])
     if (H5I_INVALID_HID == (fid = H5Fcreate(out_filename, H5F_ACC_TRUNC, H5P_DEFAULT, fapl_id)))
         GOTO_ERROR
 
+    /* Create the link access property list
+     *
+     * As an aside, this code was originally intended to interpret the
+     * dataset names as a group hierarchy which should be created by
+     * this code. The NERSC tests did not do this, however, and just
+     * munged the filename. Using -g optionally restores this original
+     * intent.
+     */
+    if (H5I_INVALID_HID == (lcpl_id = H5Pcreate(H5P_LINK_CREATE)))
+        GOTO_ERROR
+    if (create_intermediate_groups)
+        if (H5Pset_create_intermediate_group(lcpl_id, 1) < 0)
+            GOTO_ERROR
+
     /* Start timing dataset creation */
     MPI_Barrier(MPI_COMM_WORLD);
     timer_on(DSET_CREATE_TIMER); 
@@ -356,7 +382,7 @@ main(int argc, char* argv[])
             GOTO_ERROR
 
         /* Create dataset */
-        if (H5I_INVALID_HID == (did = H5Dcreate(fid, dset_info_names[i], H5T_NATIVE_CHAR, fsid, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)))
+        if (H5I_INVALID_HID == (did = H5Dcreate(fid, dset_info_names[i], H5T_NATIVE_CHAR, fsid, lcpl_id, H5P_DEFAULT, H5P_DEFAULT)))
             GOTO_ERROR
 
         /* Close up */
@@ -466,6 +492,7 @@ error:
     H5E_BEGIN_TRY {
         H5Fclose(fid);
         H5Pclose(fapl_id);
+        H5Pclose(lcpl_id);
         H5Sclose(fsid);
         H5Dclose(did);
     } H5E_END_TRY;
